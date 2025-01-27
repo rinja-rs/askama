@@ -14,7 +14,7 @@ edition = "2021"
 rust-version = "1.65"
 
 [dependencies]
-nom = { version = "7", default-features = false, features = ["alloc"] }
+nom = { version = "8", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 criterion = "0.5"
