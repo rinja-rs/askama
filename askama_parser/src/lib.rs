@@ -14,8 +14,8 @@ use nom::character::complete::{anychar, char, one_of, satisfy};
 use nom::combinator::{cut, eof, map, opt, recognize};
 use nom::error::{Error, ErrorKind, FromExternalError};
 use nom::multi::{many0_count, many1};
-use nom::sequence::{delimited, pair, preceded, terminated, tuple};
-use nom::{error_position, AsChar, InputTakeAtPosition};
+use nom::sequence::{delimited, pair, preceded, terminated};
+use nom::{error_position, AsChar, Input, Parser};
 
 pub mod expr;
 pub use expr::{Expr, Filter};
@@ -93,7 +93,7 @@ impl<'a> Ast<'a> {
         syntax: &Syntax<'_>,
     ) -> Result<Self, ParseError> {
         let parse = |i: &'a str| Node::many(i, &State::new(syntax));
-        let (input, message) = match terminated(parse, cut(eof))(src) {
+        let (input, message) = match terminated(parse, cut(eof)).parse(src) {
             Ok(("", nodes)) => return Ok(Self { nodes }),
             Ok(_) => unreachable!("eof() is not eof?"),
             Err(
@@ -252,16 +252,16 @@ fn not_ws(c: char) -> bool {
 }
 
 fn ws<'a, O>(
-    inner: impl FnMut(&'a str) -> ParseResult<'a, O>,
-) -> impl FnMut(&'a str) -> ParseResult<'a, O> {
+    inner: impl Parser<&'a str, Output = O, Error = ErrorContext<'a>>,
+) -> impl Parser<&'a str, Output = O, Error = ErrorContext<'a>> {
     delimited(take_till(not_ws), inner, take_till(not_ws))
 }
 
 /// Skips input until `end` was found, but does not consume it.
 /// Returns tuple that would be returned when parsing `end`.
 fn skip_till<'a, O>(
-    end: impl FnMut(&'a str) -> ParseResult<'a, O>,
-) -> impl FnMut(&'a str) -> ParseResult<'a, (&'a str, O)> {
+    end: impl Parser<&'a str, Output = O, Error = ErrorContext<'a>>,
+) -> impl Parser<&'a str, Output = (&'a str, O), Error = ErrorContext<'a>> {
     enum Next<O> {
         IsEnd(O),
         NotEnd,
@@ -270,7 +270,7 @@ fn skip_till<'a, O>(
     move |start: &'a str| {
         let mut i = start;
         loop {
-            let (j, is_end) = next(i)?;
+            let (j, is_end) = next.parse(i)?;
             match is_end {
                 Next::IsEnd(lookahead) => return Ok((i, (j, lookahead))),
                 Next::NotEnd => i = j,
@@ -279,7 +279,7 @@ fn skip_till<'a, O>(
     }
 }
 
-fn keyword<'a>(k: &'a str) -> impl FnMut(&'a str) -> ParseResult<'a> {
+fn keyword<'a>(k: &'a str) -> impl Parser<&'a str, Output = &'a str, Error = ErrorContext<'a>> {
     move |i: &'a str| -> ParseResult<'a> {
         let (j, v) = identifier(i)?;
         if k == v {
@@ -305,11 +305,11 @@ fn identifier(input: &str) -> ParseResult<'_> {
         )
     }
 
-    recognize(pair(start, opt(tail)))(input)
+    recognize(pair(start, opt(tail))).parse(input)
 }
 
 fn bool_lit(i: &str) -> ParseResult<'_> {
-    alt((keyword("false"), keyword("true")))(i)
+    alt((keyword("false"), keyword("true"))).parse(i)
 }
 
 fn num_lit(i: &str) -> ParseResult<'_> {
@@ -327,57 +327,59 @@ fn num_lit(i: &str) -> ParseResult<'_> {
             tag("u64"),
             tag("u128"),
             tag("usize"),
-        ))(i)
+        ))
+        .parse(i)
     };
-    let float_suffix = |i| alt((tag("f32"), tag("f64")))(i);
+    let float_suffix = |i| alt((tag("f32"), tag("f64"))).parse(i);
 
-    recognize(tuple((
+    recognize((
         opt(char('-')),
         alt((
-            recognize(tuple((
+            recognize((
                 char('0'),
                 alt((
-                    recognize(tuple((char('b'), separated_digits(2, false)))),
-                    recognize(tuple((char('o'), separated_digits(8, false)))),
-                    recognize(tuple((char('x'), separated_digits(16, false)))),
+                    recognize((char('b'), separated_digits(2, false))),
+                    recognize((char('o'), separated_digits(8, false))),
+                    recognize((char('x'), separated_digits(16, false))),
                 )),
                 opt(integer_suffix),
-            ))),
-            recognize(tuple((
+            )),
+            recognize((
                 separated_digits(10, true),
                 opt(alt((
                     integer_suffix,
                     float_suffix,
-                    recognize(tuple((
-                        opt(tuple((char('.'), separated_digits(10, true)))),
+                    recognize((
+                        opt((char('.'), separated_digits(10, true))),
                         one_of("eE"),
                         opt(one_of("+-")),
                         separated_digits(10, false),
                         opt(float_suffix),
-                    ))),
-                    recognize(tuple((
-                        char('.'),
-                        separated_digits(10, true),
-                        opt(float_suffix),
-                    ))),
+                    )),
+                    recognize((char('.'), separated_digits(10, true), opt(float_suffix))),
                 ))),
-            ))),
+            )),
         )),
-    )))(i)
+    ))
+    .parse(i)
 }
 
 /// Underscore separated digits of the given base, unless `start` is true this may start
 /// with an underscore.
-fn separated_digits(radix: u32, start: bool) -> impl Fn(&str) -> ParseResult<'_> {
+fn separated_digits<'a>(
+    radix: u32,
+    start: bool,
+) -> impl Parser<&'a str, Output = &'a str, Error = ErrorContext<'a>> {
     move |i| {
-        recognize(tuple((
+        recognize((
             |i| match start {
                 true => Ok((i, 0)),
-                false => many0_count(char('_'))(i),
+                false => many0_count(char('_')).parse(i),
             },
             satisfy(|ch| ch.is_digit(radix)),
             many0_count(satisfy(|ch| ch == '_' || ch.is_digit(radix))),
-        )))(i)
+        ))
+        .parse(i)
     }
 }
 
@@ -386,7 +388,8 @@ fn str_lit(i: &str) -> ParseResult<'_> {
         char('"'),
         opt(escaped(is_not("\\\""), '\\', anychar)),
         char('"'),
-    )(i)?;
+    )
+    .parse(i)?;
     Ok((i, s.unwrap_or_default()))
 }
 
@@ -398,7 +401,8 @@ fn char_lit(i: &str) -> ParseResult<'_> {
         char('\''),
         opt(escaped(is_not("\\\'"), '\\', anychar)),
         char('\''),
-    )(i)?;
+    )
+    .parse(i)?;
 
     let Some(s) = s else {
         return Err(nom::Err::Failure(ErrorContext::new(
@@ -459,7 +463,7 @@ impl<'a> Char<'a> {
             return Ok(("", Self::Literal));
         }
         map(
-            tuple((
+            (
                 char('\\'),
                 alt((
                     map(char('n'), |_| Self::Escaped),
@@ -471,24 +475,25 @@ impl<'a> Char<'a> {
                     // Not useful but supported by rust.
                     map(char('"'), |_| Self::Escaped),
                     map(
-                        tuple((
+                        (
                             char('x'),
                             take_while_m_n(2, 2, |c: char| c.is_ascii_hexdigit()),
-                        )),
+                        ),
                         |(_, s)| Self::AsciiEscape(s),
                     ),
                     map(
-                        tuple((
+                        (
                             tag("u{"),
                             take_while_m_n(1, 6, |c: char| c.is_ascii_hexdigit()),
                             char('}'),
-                        )),
+                        ),
                         |(_, s, _)| Self::UnicodeEscape(s),
                     ),
                 )),
-            )),
+            ),
             |(_, ch)| ch,
-        )(i)
+        )
+        .parse(i)
     }
 }
 
@@ -501,7 +506,7 @@ fn path_or_identifier(i: &str) -> ParseResult<'_, PathOrIdentifier<'_>> {
     let root = ws(opt(tag("::")));
     let tail = opt(many1(preceded(ws(tag("::")), identifier)));
 
-    let (i, (root, start, rest)) = tuple((root, identifier, tail))(i)?;
+    let (i, (root, start, rest)) = (root, identifier, tail).parse(i)?;
     let rest = rest.as_deref().unwrap_or_default();
 
     // The returned identifier can be assumed to be path if:
@@ -554,27 +559,27 @@ impl<'a> State<'a> {
     }
 
     fn tag_block_start<'i>(&self, i: &'i str) -> ParseResult<'i> {
-        tag(self.syntax.block_start)(i)
+        tag(self.syntax.block_start).parse(i)
     }
 
     fn tag_block_end<'i>(&self, i: &'i str) -> ParseResult<'i> {
-        tag(self.syntax.block_end)(i)
+        tag(self.syntax.block_end).parse(i)
     }
 
     fn tag_comment_start<'i>(&self, i: &'i str) -> ParseResult<'i> {
-        tag(self.syntax.comment_start)(i)
+        tag(self.syntax.comment_start).parse(i)
     }
 
     fn tag_comment_end<'i>(&self, i: &'i str) -> ParseResult<'i> {
-        tag(self.syntax.comment_end)(i)
+        tag(self.syntax.comment_end).parse(i)
     }
 
     fn tag_expr_start<'i>(&self, i: &'i str) -> ParseResult<'i> {
-        tag(self.syntax.expr_start)(i)
+        tag(self.syntax.expr_start).parse(i)
     }
 
     fn tag_expr_end<'i>(&self, i: &'i str) -> ParseResult<'i> {
-        tag(self.syntax.expr_end)(i)
+        tag(self.syntax.expr_end).parse(i)
     }
 
     fn enter_loop(&self) {
@@ -635,13 +640,13 @@ impl Level {
     const MAX_DEPTH: u8 = 128;
 }
 
-#[allow(clippy::type_complexity)]
 fn filter(i: &str, level: Level) -> ParseResult<'_, (&str, Option<Vec<Expr<'_>>>)> {
-    let (i, (_, fname, args)) = tuple((
+    let (i, (_, fname, args)) = (
         char('|'),
         ws(identifier),
         opt(|i| Expr::arguments(i, level, false)),
-    ))(i)?;
+    )
+        .parse(i)?;
     Ok((i, (fname, args)))
 }
 

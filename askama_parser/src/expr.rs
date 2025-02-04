@@ -8,7 +8,8 @@ use nom::combinator::{cut, map, not, opt, peek, recognize};
 use nom::error::ErrorKind;
 use nom::error_position;
 use nom::multi::{fold_many0, many0, separated_list0};
-use nom::sequence::{pair, preceded, terminated, tuple};
+use nom::sequence::{pair, preceded, terminated};
+use nom::Parser;
 
 use super::{
     char_lit, filter, identifier, not_ws, num_lit, path_or_identifier, str_lit, ws, Level,
@@ -24,7 +25,7 @@ macro_rules! expr_prec_layer {
             let (i, right) = many0(pair(
                 ws(tag($op)),
                 |i| Self::$inner(i, level),
-            ))(i)?;
+            )).parse(i)?;
             Ok((
                 i,
                 right.into_iter().fold(left, |left, (op, right)| {
@@ -40,7 +41,7 @@ macro_rules! expr_prec_layer {
             let (i, right) = many0(pair(
                 ws(alt(($( tag($op) ),+,))),
                 |i| Self::$inner(i, level),
-            ))(i)?;
+            )).parse(i)?;
             Ok((
                 i,
                 right.into_iter().fold(left, |left, (op, right)| {
@@ -108,7 +109,8 @@ impl<'a> Expr<'a> {
                                 )
                             },
                             move |i| Self::parse(i, level),
-                        ))(i)?;
+                        ))
+                        .parse(i)?;
                         if has_named_arguments && !matches!(expr, Self::NamedArgument(_, _)) {
                             Err(nom::Err::Failure(ErrorContext::new(
                                 "named arguments must always be passed last",
@@ -119,9 +121,10 @@ impl<'a> Expr<'a> {
                         }
                     }),
                 ),
-                tuple((opt(ws(char(','))), char(')'))),
+                (opt(ws(char(','))), char(')')),
             )),
-        )(i)
+        )
+        .parse(i)
     }
 
     fn named_argument(
@@ -139,7 +142,7 @@ impl<'a> Expr<'a> {
 
         let (_, level) = level.nest(i)?;
         let (i, (argument, _, value)) =
-            tuple((identifier, ws(char('=')), move |i| Self::parse(i, level)))(i)?;
+            (identifier, ws(char('=')), move |i| Self::parse(i, level)).parse(i)?;
         if named_arguments.insert(argument) {
             Ok((i, Self::NamedArgument(argument, Box::new(value))))
         } else {
@@ -156,7 +159,8 @@ impl<'a> Expr<'a> {
             pair(
                 ws(alt((tag("..="), tag("..")))),
                 opt(move |i| Self::or(i, level)),
-            )(i)
+            )
+            .parse(i)
         };
         alt((
             map(range_right, |(op, right)| {
@@ -169,7 +173,8 @@ impl<'a> Expr<'a> {
                     None => left,
                 },
             ),
-        ))(i)
+        ))
+        .parse(i)
     }
 
     // Keep in sync with `TWO_PLUS_CHAR_OPS`, below
@@ -186,7 +191,7 @@ impl<'a> Expr<'a> {
     fn filtered(i: &'a str, level: Level) -> ParseResult<'a, Self> {
         let (_, level) = level.nest(i)?;
         let (i, (obj, filters)) =
-            tuple((|i| Self::prefix(i, level), many0(|i| filter(i, level))))(i)?;
+            (|i| Self::prefix(i, level), many0(|i| filter(i, level))).parse(i)?;
 
         let mut res = obj;
         for (fname, args) in filters {
@@ -207,7 +212,8 @@ impl<'a> Expr<'a> {
         let (_, nested) = level.nest(i)?;
         let (i, (ops, mut expr)) = pair(many0(ws(alt((tag("!"), tag("-"))))), |i| {
             Suffix::parse(i, nested)
-        })(i)?;
+        })
+        .parse(i)?;
 
         for op in ops.iter().rev() {
             // This is a rare place where we create recursion in the parsed AST
@@ -229,23 +235,24 @@ impl<'a> Expr<'a> {
             Self::path_var_bool,
             move |i| Self::array(i, level),
             move |i| Self::group(i, level),
-        ))(i)
+        ))
+        .parse(i)
     }
 
     fn group(i: &'a str, level: Level) -> ParseResult<'a, Self> {
         let (_, level) = level.nest(i)?;
-        let (i, expr) = preceded(ws(char('(')), opt(|i| Self::parse(i, level)))(i)?;
+        let (i, expr) = preceded(ws(char('(')), opt(|i| Self::parse(i, level))).parse(i)?;
         let expr = match expr {
             Some(expr) => expr,
             None => {
-                let (i, _) = char(')')(i)?;
+                let (i, _) = char(')').parse(i)?;
                 return Ok((i, Self::Tuple(vec![])));
             }
         };
 
-        let (i, comma) = ws(opt(peek(char(','))))(i)?;
+        let (i, comma) = ws(opt(peek(char(',')))).parse(i)?;
         if comma.is_none() {
-            let (i, _) = char(')')(i)?;
+            let (i, _) = char(')').parse(i)?;
             return Ok((i, Self::Group(Box::new(expr))));
         }
 
@@ -256,8 +263,9 @@ impl<'a> Expr<'a> {
             |_, expr| {
                 exprs.push(expr);
             },
-        )(i)?;
-        let (i, _) = pair(ws(opt(char(','))), char(')'))(i)?;
+        )
+        .parse(i)?;
+        let (i, _) = pair(ws(opt(char(','))), char(')')).parse(i)?;
         Ok((i, Self::Tuple(exprs)))
     }
 
@@ -272,7 +280,8 @@ impl<'a> Expr<'a> {
                 ),
                 pair(opt(ws(char(','))), char(']')),
             )),
-        )(i)
+        )
+        .parse(i)
     }
 
     fn path_var_bool(i: &'a str) -> ParseResult<'a, Self> {
@@ -281,19 +290,20 @@ impl<'a> Expr<'a> {
             PathOrIdentifier::Identifier(v @ "true") => Self::BoolLit(v),
             PathOrIdentifier::Identifier(v @ "false") => Self::BoolLit(v),
             PathOrIdentifier::Identifier(v) => Self::Var(v),
-        })(i)
+        })
+        .parse(i)
     }
 
     fn str(i: &'a str) -> ParseResult<'a, Self> {
-        map(str_lit, Self::StrLit)(i)
+        map(str_lit, Self::StrLit).parse(i)
     }
 
     fn num(i: &'a str) -> ParseResult<'a, Self> {
-        map(num_lit, Self::NumLit)(i)
+        map(num_lit, Self::NumLit).parse(i)
     }
 
     fn char(i: &'a str) -> ParseResult<'a, Self> {
-        map(char_lit, Self::CharLit)(i)
+        map(char_lit, Self::CharLit).parse(i)
     }
 }
 
@@ -323,7 +333,8 @@ impl<'a> Suffix<'a> {
                 |i| Self::call(i, level),
                 Self::r#try,
                 Self::r#macro,
-            )))(i)?;
+            )))
+            .parse(i)?;
 
             match suffix {
                 Some(Self::Attr(attr)) => expr = Expr::Attr(expr.into(), attr),
@@ -398,7 +409,8 @@ impl<'a> Suffix<'a> {
                 map(recognize(nested_parenthesis), Self::MacroCall),
                 char(')'),
             )),
-        )(i)
+        )
+        .parse(i)
     }
 
     fn attr(i: &'a str) -> ParseResult<'a, Self> {
@@ -408,7 +420,8 @@ impl<'a> Suffix<'a> {
                 cut(alt((num_lit, identifier))),
             ),
             Self::Attr,
-        )(i)
+        )
+        .parse(i)
     }
 
     fn index(i: &'a str, level: Level) -> ParseResult<'a, Self> {
@@ -419,16 +432,17 @@ impl<'a> Suffix<'a> {
                 cut(terminated(ws(move |i| Expr::parse(i, level)), char(']'))),
             ),
             Self::Index,
-        )(i)
+        )
+        .parse(i)
     }
 
     fn call(i: &'a str, level: Level) -> ParseResult<'a, Self> {
         let (_, level) = level.nest(i)?;
-        map(move |i| Expr::arguments(i, level, false), Self::Call)(i)
+        map(move |i| Expr::arguments(i, level, false), Self::Call).parse(i)
     }
 
     fn r#try(i: &'a str) -> ParseResult<'a, Self> {
-        map(preceded(take_till(not_ws), char('?')), |_| Self::Try)(i)
+        map(preceded(take_till(not_ws), char('?')), |_| Self::Try).parse(i)
     }
 }
 
