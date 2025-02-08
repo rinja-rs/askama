@@ -25,19 +25,36 @@ pub use node::Node;
 mod tests;
 
 mod _parsed {
+    use std::fmt;
     use std::path::Path;
     use std::rc::Rc;
-    use std::{fmt, mem};
+
+    use ouroboros::self_referencing;
 
     use super::node::Node;
     use super::{Ast, ParseError, Syntax};
 
-    #[derive(Default)]
-    pub struct Parsed {
-        // `source` must outlive `ast`, so `ast` must be declared before `source`
-        ast: Ast<'static>,
-        #[allow(dead_code)]
+    #[self_referencing]
+    struct ParsedInternal {
         source: String,
+        #[covariant]
+        #[borrows(source)]
+        ast: Ast<'this>,
+    }
+
+    pub struct Parsed {
+        internal: ParsedInternal,
+    }
+
+    impl Default for Parsed {
+        fn default() -> Self {
+            let internal = ParsedInternalBuilder {
+                source: Default::default(),
+                ast_builder: |_| Default::default(),
+            }
+            .build();
+            Parsed { internal }
+        }
     }
 
     impl Parsed {
@@ -48,31 +65,30 @@ mod _parsed {
             file_path: Option<Rc<Path>>,
             syntax: &Syntax<'_>,
         ) -> Result<Self, ParseError> {
-            // Self-referential borrowing: `self` will keep the source alive as `String`,
-            // internally we will transmute it to `&'static str` to satisfy the compiler.
-            // However, we only expose the nodes with a lifetime limited to `self`.
-            let src = unsafe { mem::transmute::<&str, &'static str>(source.as_str()) };
-            let ast = Ast::from_str(src, file_path, syntax)?;
-            Ok(Self { ast, source })
+            let internal = ParsedInternalTryBuilder {
+                source,
+                ast_builder: |src: &String| Ast::from_str(src, file_path, syntax),
+            }
+            .try_build()?;
+            Ok(Self { internal })
         }
 
-        // The return value's lifetime must be limited to `self` to uphold the unsafe invariant.
         pub fn nodes(&self) -> &[Node<'_>] {
-            &self.ast.nodes
+            &self.internal.borrow_ast().nodes
         }
     }
 
     impl fmt::Debug for Parsed {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.debug_struct("Parsed")
-                .field("nodes", &self.ast.nodes)
+                .field("nodes", &self.internal.borrow_ast().nodes)
                 .finish_non_exhaustive()
         }
     }
 
     impl PartialEq for Parsed {
         fn eq(&self, other: &Self) -> bool {
-            self.ast.nodes == other.ast.nodes
+            self.internal.borrow_ast().nodes == other.internal.borrow_ast().nodes
         }
     }
 }
